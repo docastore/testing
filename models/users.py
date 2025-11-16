@@ -200,3 +200,63 @@ def add_balance_by_doc(doc_code: str, amount: float):
     updated = cur.rowcount > 0
     conn.close()
     return updated
+
+def update_recharge_message_id(recarga_id, message_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE recargas SET message_id = ? WHERE id = ?",
+            (message_id, recarga_id)
+        )
+        conn.commit()
+
+def update_recharge_message_id(recarga_id: int, message_id: int) -> None:
+    """
+    Salva o message_id da mensagem do Telegram onde foi enviado o QRCode do PIX.
+    Tabela correta: recharges.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE recharges SET message_id = ? WHERE id = ?",
+                (message_id, recarga_id),
+            )
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            # Se por algum motivo a coluna não existir, cria e tenta de novo
+            if "no such column: message_id" in str(e):
+                cur.execute("ALTER TABLE recharges ADD COLUMN message_id INTEGER")
+                conn.commit()
+                cur.execute(
+                    "UPDATE recharges SET message_id = ? WHERE id = ?",
+                    (message_id, recarga_id),
+                )
+                conn.commit()
+            else:
+                raise
+
+
+def get_last_recharge_by_doc(doc_code: str):
+    """
+    Retorna a última recarga (dict) para um DOC (external_reference),
+    incluindo o message_id salvo.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT r.*
+            FROM recharges r
+            JOIN users u ON u.id = r.user_id
+            WHERE u.doc_code = ?
+            ORDER BY r.id DESC
+            LIMIT 1
+            """,
+            (doc_code,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(row)

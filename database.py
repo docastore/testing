@@ -85,3 +85,17 @@ def init_db():
         """)
 
         print("📦 Banco inicializado com sucesso.")
+
+        # TABELA PARA CONTROLAR PAGAMENTOS DO MERCADO PAGO JÁ PROCESSADOS
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS mp_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payment_id TEXT UNIQUE NOT NULL,
+                status TEXT NOT NULL,
+                status_detail TEXT,
+                amount REAL NOT NULL,
+                external_reference TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+

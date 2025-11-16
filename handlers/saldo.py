@@ -1,13 +1,20 @@
 from aiogram import Router, types, F
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InputMediaPhoto
+from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramBadRequest
 
 import base64
 import mercadopago
 
-from config import MP_ACCESS_TOKEN  # se você tiver MP_WEBHOOK_URL pode manter, mas não é obrigatório aqui
-from models.users import get_or_create_user, get_bonus_percent, create_recharge
-from utils.keyboards import kb_saldo, kb_recarga_opcoes
-from utils.helpers import extract_amount
+from config import MP_ACCESS_TOKEN
+from models.users import (
+    get_or_create_user,
+    get_bonus_percent,
+    create_recharge,
+    update_recharge_message_id,
+)
+from utils.keyboards import kb_saldo
+from states.recharge_state import RechargeState
 
 router = Router()
 
@@ -17,7 +24,7 @@ router = Router()
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
 
-def gerar_pix(doc_id: str, valor: float):
+def gerar_pix(doc_code: str, valor: float):
     """
     Cria um pagamento PIX no Mercado Pago e retorna
     o código copia-e-cola, o base64 da imagem do QR e o ticket_url.
@@ -27,8 +34,8 @@ def gerar_pix(doc_id: str, valor: float):
         "description": f"Recarga DocaStoreBot - R$ {valor}",
         "payment_method_id": "pix",
         "payer": {"email": "cliente@docastore.com"},
-        "external_reference": doc_id,
-        # Aqui você já configurou com a URL HTTPS do ngrok
+        "external_reference": doc_code,
+        # URL pública do webhook (/mp/webhook)
         "notification_url": "https://alyssa-unvague-unceasingly.ngrok-free.dev/mp/webhook",
     }
 
@@ -52,7 +59,11 @@ def gerar_pix(doc_id: str, valor: float):
 # BOTÃO "FAZER RECARGA"
 # ===========================
 @router.callback_query(F.data == "saldo_recarregar")
-async def saldo_recarregar(callback: types.CallbackQuery):
+async def saldo_recarregar(callback: types.CallbackQuery, state: FSMContext):
+    """
+    Mostra a tela onde o usuário DIGITA o valor da recarga.
+    Tudo em cima da MESMA mensagem do menu saldo.
+    """
     bonus = get_bonus_percent()
 
     if bonus > 0:
@@ -64,51 +75,110 @@ async def saldo_recarregar(callback: types.CallbackQuery):
         bonus_txt = "No momento não há bônus ativo nas recargas."
 
     caption = f"""
-💸 *Fazer recarga*
-
-Escolha um dos valores abaixo para gerar um pedido de recarga.
+💸 *Recarga via Pix automático*
 
 {bonus_txt}
 
-O bot vai gerar um *PIX Copia e Cola* e um QR Code.
-Assim que o pagamento for aprovado, o saldo cai automaticamente. ✅
-"""
+Digite o valor que você quer adicionar de saldo:
 
-    await callback.message.edit_caption(
-        caption=caption,
-        reply_markup=kb_recarga_opcoes()
+• Ex: `25`  (R$ 25,00)
+• Ex: `37,50` ou `37.50`
+
+Depois de enviar o valor, o bot vai gerar um *PIX Copia e Cola* e um QR Code.
+
+Se quiser cancelar, é só clicar em *Voltar* abaixo.
+""".strip()
+
+    # mantém o padrão: mesma imagem, legenda nova, botões embaixo
+    try:
+        await callback.message.edit_caption(
+            caption=caption,
+            reply_markup=kb_saldo(),
+        )
+    except TelegramBadRequest as e:
+        # se for "message is not modified", ignoramos (usuário clicou de novo no mesmo botão)
+        if "message is not modified" in str(e):
+            pass
+        else:
+            raise
+
+    # guarda qual é a mensagem "principal" que vamos editar depois
+    await state.update_data(
+        menu_message_id=callback.message.message_id,
+        chat_id=callback.message.chat.id,
     )
+
+    await state.set_state(RechargeState.waiting_amount)
     await callback.answer()
 
 
 # ===========================
-# CLIQUE EM UM VALOR DE RECARGA
-# (gera PIX + cria registro da recarga)
+# USUÁRIO DIGITA O VALOR
 # ===========================
-@router.callback_query(F.data.startswith("recar_"))
-async def processar_recarga(callback: types.CallbackQuery):
-    # 1) Descobre o valor escolhido (ex: recar_25 -> 25.0)
-    valor = extract_amount(callback.data)
-    if valor <= 0:
-        await callback.answer("Valor inválido.", show_alert=True)
+@router.message(RechargeState.waiting_amount)
+async def processar_valor_digitado(msg: types.Message, state: FSMContext):
+    texto = (msg.text or "").strip()
+
+    # normaliza: tira "R$", espaços, troca vírgula por ponto
+    texto_clean = (
+        texto.replace("R$", "")
+        .replace("r$", "")
+        .replace(" ", "")
+        .replace(",", ".")
+    )
+
+    try:
+        valor = float(texto_clean)
+    except ValueError:
+        await msg.answer(
+            "❌ Não entendi o valor.\n\n"
+            "Manda só o número, por exemplo:\n"
+            "`25` ou `37.50`.",
+        )
         return
 
-    # 2) Garante que o usuário existe e cria registro de recarga
-    user = get_or_create_user(callback.from_user.id)
-    rec = create_recharge(user["id"], valor)
+    if valor <= 0:
+        await msg.answer("❌ Valor inválido. Digite um valor maior que zero.")
+        return
 
-    # 3) Chama o Mercado Pago para gerar o PIX
+    if valor < 5:
+        await msg.answer("⚠️ O valor mínimo de recarga é R$ 5,00.")
+        return
+
+    # recupera dados do estado: qual mensagem vamos editar
+    data = await state.get_data()
+    menu_message_id = data.get("menu_message_id")
+    chat_id = data.get("chat_id") or msg.chat.id
+
+    # 1) Garante que o usuário existe
+    user = get_or_create_user(msg.from_user.id)
+
+    # 2) Cria o registro da recarga
+    try:
+        rec = create_recharge(user["id"], valor)
+    except Exception as e:
+        print("[BOT] Erro ao criar recarga:", e)
+        await msg.answer("❌ Não foi possível registrar a recarga. Tente novamente mais tarde.")
+        await state.clear()
+        return
+
+    # 3) Gera o PIX
     try:
         pix = gerar_pix(user["doc_code"], valor)
     except Exception as e:
         print("[MP] Erro ao gerar PIX:", e)
-        await callback.answer(
-            "Não foi possível gerar o PIX agora. Tente novamente mais tarde.",
-            show_alert=True
+        await msg.answer(
+            "❌ Não foi possível gerar o PIX agora. "
+            "Tente novamente mais tarde."
         )
+        await state.clear()
         return
 
-    bonus_txt = f"{rec['bonus_percent']:.0f}% ( + R$ {rec['bonus_amount']:.2f} )" if rec["bonus_percent"] > 0 else "0%"
+    bonus_txt = (
+        f"{rec['bonus_percent']:.0f}% ( + R$ {rec['bonus_amount']:.2f} )"
+        if rec["bonus_percent"] > 0
+        else "0%"
+    )
 
     caption = f"""
 ✅ *Pedido de recarga criado!*
@@ -124,28 +194,66 @@ async def processar_recarga(callback: types.CallbackQuery):
 `{pix['qr_code']}`
 
 Assim que o pagamento for aprovado, seu saldo será atualizado automaticamente. 🚀
-"""
+""".strip()
 
-    # 4) Decodifica o base64 da imagem do QR para mandar como foto
+    # tenta manter o fluxo em UMA mensagem:
     try:
         img_bytes = base64.b64decode(pix["qr_base64"])
         photo = BufferedInputFile(img_bytes, filename="qrcode_pix.png")
 
-        await callback.message.answer_photo(
-            photo=photo,
-            caption=caption,
-            reply_markup=kb_saldo()
-        )
-    except Exception as e:
-        # Se por algum motivo falhar o base64, manda só texto mesmo
-        print("[BOT] Erro ao enviar imagem do QR:", e)
-        await callback.message.answer(
-            caption,
-            reply_markup=kb_saldo()
+        # 1) troca a foto pela do QR
+        await msg.bot.edit_message_media(
+            chat_id=chat_id,
+            message_id=menu_message_id,
+            media=InputMediaPhoto(media=photo),
         )
 
-    await callback.answer("PIX gerado. Pague e aguarde a aprovação. 😉")
+        # 2) troca a legenda da mesma mensagem
+        await msg.bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=menu_message_id,
+            caption=caption,
+            reply_markup=kb_saldo(),
+        )
+
+        # 3) salva o message_id na recarga para o webhook editar depois
+        try:
+            update_recharge_message_id(rec["id"], menu_message_id)
+        except Exception as e:
+            print("[BOT] Erro ao salvar message_id da recarga:", e)
+
+    except Exception as e:
+        # fallback: se der ruim pra editar a mídia, manda mensagem nova (não é o ideal, mas não quebra)
+        print("[BOT] Erro ao editar mensagem principal com QR:", e)
+        try:
+            img_bytes = base64.b64decode(pix["qr_base64"])
+            photo = BufferedInputFile(img_bytes, filename="qrcode_pix.png")
+
+            env = await msg.answer_photo(
+                photo=photo,
+                caption=caption,
+                reply_markup=kb_saldo(),
+            )
+            update_recharge_message_id(rec["id"], env.message_id)
+        except Exception as e2:
+            print("[BOT] Erro no fallback do QR:", e2)
+            await msg.answer(
+                caption,
+                reply_markup=kb_saldo(),
+            )
+
+    # apaga a mensagem do valor digitado pra deixar o chat clean
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    await state.clear()
 
 
 def register_saldo_handlers(dp):
+    """
+    Registra todas as rotas de saldo no Dispatcher principal.
+    O main.py faz: register_saldo_handlers(dp)
+    """
     dp.include_router(router)
